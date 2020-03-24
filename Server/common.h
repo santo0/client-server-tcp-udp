@@ -62,10 +62,13 @@ typedef struct  CFG_PARAMS{
 }CFG_PARAMS;
 
 typedef struct DEVICE {
-    int shm_id;
+    int state_shm_id;
+    int elems_shm_id;
+    int rand_num_shm_id;
     int *state;                 /*Esta amb memoria compartida*/
+    char *rand_num;
+    char *elems;             /*Haurie d'estar amb memoria compartida*/
     char id[13];
-    char elems[41];             /*Haurie d'estar amb memoria compartida*/     
     /*elems es pot fer amb punter a string i ya*/
 }DEVICE;
 

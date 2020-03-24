@@ -3,6 +3,8 @@
 PARSED_ARGS get_parsed_arguments(int argc, char **argv);
 CFG_PARAMS get_parsed_configuration_file_params(PARSED_ARGS args);
 NODE *get_valid_devices(char *bbdd_dev_name);
+int get_shmem_chars(char **target);
+int get_shmem_int(int **target);
 void store_id_to_linked_list(struct NODE **head, char *id);
 void print_all_devices(NODE *head);
 void free_all_reserved(NODE *head, int shm_id_run_server);
@@ -173,9 +175,15 @@ void free_all_reserved(NODE *head, int shm_id_run_server)
     shmctl(shm_id_run_server, IPC_PRIVATE, NULL);
     while (node->dvc != NULL)
     {
-        printf("goodbye %d\n", ((*(*node).dvc).shm_id));
         shmdt((const void *)(*(*node).dvc).state);
-        shmctl(((*(*node).dvc).shm_id), IPC_RMID, NULL);
+        shmctl(((*(*node).dvc).state_shm_id), IPC_RMID, NULL);
+        printf("goodbye %d\n", ((*(*node).dvc).state_shm_id));
+        shmdt((const void *)(*(*node).dvc).elems);
+        shmctl(((*(*node).dvc).elems_shm_id), IPC_RMID, NULL);
+        printf("goodbye %d\n", ((*(*node).dvc).elems_shm_id));
+        shmdt((const void *)(*(*node).dvc).rand_num);
+        shmctl(((*(*node).dvc).rand_num_shm_id), IPC_RMID, NULL);
+        printf("goodbye %d\n", ((*(*node).dvc).rand_num_shm_id));
         free(node->dvc);
         node = node->next;
     }
@@ -189,17 +197,36 @@ void free_all_reserved(NODE *head, int shm_id_run_server)
         free(node_to_delete);
     }
 }
+/*
+void print_all_devices(NODE *head)
+{
+    NODE *node = head;
+    printf("----Id----\t--RNDM--\t------ IP -----\t----ESTAT---\t--ELEMENTS-------------------------------------------\n");
+    while (node->dvc != NULL)
+    {
+        printf("%s\t%s\t%s\t%s\t%s\n", 
+                (*(*(*node).dvc).id), 
+                (*(*(*node).dvc).rand_num), 
+                "FALTE LA IP", 
+                get_state_name((*(*(*node).dvc).state)),
+                (*(*(*node).dvc).elems));
+        node = node->next;
+    }
+}
+*/
 
 void print_all_devices(NODE *head)
 {
     NODE *node = head;
-    printf("-----Id.---- --RNDM-- ------ IP ----- ----ESTAT--- --ELEMENTS-------------------------------------------\n");
+    printf("----Id----\t--RNDM--\t------ IP -----\t----ESTAT---\t--ELEMENTS-------------------------------------------\n");
     while (node->dvc != NULL)
     {
-        printf("%s\t-\t%s\n", node->dvc->id, get_state_name((*(*(*node).dvc).state)));
+        printf("%s\n", node->dvc->id);
+        printf("%d\n", *(node->dvc->state));
         node = node->next;
     }
 }
+
 
 NODE *get_valid_devices(char *bbdd_dev_name)
 {
@@ -212,42 +239,80 @@ NODE *get_valid_devices(char *bbdd_dev_name)
     while (fgets(buffer, BUFF_SIZE, file_pointer))
     {
         store_id_to_linked_list(&head, trim_string(buffer));
+        printf("dispo acabat->%s\n", head->dvc->id);
     }
     fclose(file_pointer);
     return head;
 }
 
+/*Canviar el nom: store_client_from_id*/
 void store_id_to_linked_list(NODE **head, char *id)
 {
-    int shm_id;
+    int cl_state_shm_id;
+    int rand_num_shm_id;
+    int elems_shm_id;
     int *cl_state;
+    char *elems;
+    char *rand_num;
     NODE *new_node;
     DEVICE *new_device;
-    shm_id = shmget(IPC_PRIVATE, sizeof(int *), IPC_CREAT | 0666);
-    printf("node_id %d\n", shm_id);
-    if (shm_id < 0)
-    {
-        printf("*** shmget error (server) ***\n");
-        exit(1);
-    }
-    /*State of client in shared memory*/
-    cl_state = (int *)shmat(shm_id, NULL, 0);
-    if ((long)cl_state == -1)
-    {
-        printf("*** shmat error (server) ***\n");
-        exit(1);
-    }
+    cl_state_shm_id = get_shmem_int(&cl_state);
+    rand_num_shm_id = get_shmem_chars(&rand_num);
+    elems_shm_id = get_shmem_chars(&elems);
     /*linked list nodes in mallocs*/
     new_node = (NODE *)malloc(sizeof(NODE));
     new_device = (DEVICE *)malloc(sizeof(DEVICE));
     new_node->next = *head;
     new_node->dvc = new_device;
     (*(*new_node).dvc).state = cl_state;
+    (*(*new_node).dvc).elems = elems;
+    (*(*new_node).dvc).rand_num = rand_num;
     (*(*(*new_node).dvc).state) = DISCONNECTED;
-    (*(*new_node).dvc).shm_id = shm_id;
-    /*new_node->dvc->state = DISCONNECTED;*/
-    strcpy(new_node->dvc->id, id);
+    (*(*new_node).dvc).state_shm_id = cl_state_shm_id;
+    (*(*new_node).dvc).elems_shm_id = elems_shm_id;
+    (*(*new_node).dvc).rand_num_shm_id = rand_num_shm_id;
+    strcpy((*(*(new_node)).dvc).id, id);
+    printf("Prova [%s]\n", (*(*new_node).dvc).id);
     *head = new_node;
+}
+
+/*Assigna l'adreça per referencia, retorna la id del shmem*/
+int get_shmem_int(int **target)
+{
+    int shm_id;
+    shm_id = shmget(IPC_PRIVATE, sizeof(int *), IPC_CREAT | 0666);
+    printf("int shmem id %d\n", shm_id);
+    if (shm_id < 0)
+    {
+        printf("*** shmget error (server) ***\n");
+        exit(1);
+    }
+    *target = (int *)shmat(shm_id, NULL, 0);
+    if ((long)*target == -1)
+    {
+        printf("*** shmat error (server) ***\n");
+        exit(1);
+    }
+    return shm_id;
+}
+
+int get_shmem_chars(char **target)
+{
+    int shm_id;
+    shm_id = shmget(IPC_PRIVATE, sizeof(char *), IPC_CREAT | 0666);
+    printf("char shmem id %d\n", shm_id);
+    if (shm_id < 0)
+    {
+        printf("*** shmget error (server) ***\n");
+        exit(1);
+    }
+    *target = (char *)shmat(shm_id, NULL, 0);
+    if ((long)*target == -1)
+    {
+        printf("*** shmat error (server) ***\n");
+        exit(1);
+    }
+    return shm_id;
 }
 
 PARSED_ARGS get_parsed_arguments(int argc, char **argv)
