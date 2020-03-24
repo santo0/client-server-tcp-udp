@@ -16,8 +16,10 @@
 
 #include <getopt.h>
 
-#include  <sys/ipc.h>
-#include  <sys/shm.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+
+#include <signal.h>
 
 #define BUFF_SIZE 64
 
@@ -39,6 +41,10 @@
 
 #define LISTEN_THRESHOLD 4
 
+#define PDU_UDP_SIZE 84
+#define PDU_TCP_SIZE 127
+
+#define NUM_CH_PROC 3
 
 char *CFG_FILE_DEFAULT_NAME = "server.cfg";
 char *BBDD_DEV_DEFAULT_NAME = "bbdd_dev.dat";
@@ -57,9 +63,10 @@ typedef struct  CFG_PARAMS{
 
 typedef struct DEVICE {
     int shm_id;
-    int *state;
+    int *state;                 /*Esta amb memoria compartida*/
     char id[13];
-    char elems[41];     /*Aixó es pot fer amb punter a string i ya*/
+    char elems[41];             /*Haurie d'estar amb memoria compartida*/     
+    /*elems es pot fer amb punter a string i ya*/
 }DEVICE;
 
 typedef struct NODE {
