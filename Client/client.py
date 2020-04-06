@@ -89,9 +89,7 @@ def start_registration_process():
 
 def send_packet_udp(udp_sock, udp_address, packet, packet_content, new_state=None):
     global cl_state
-    #¿COMPROVACIÓ D'ERRORS EN SENDTO? -> Sí, comprovar quans bytes s'han enviat i fer un slice de lo que quede
     bytes_sent = udp_sock.sendto(packet, udp_address)
-    #packet_name = get_name_of_packet_type(packet_content[0])
     logging.debug('Enviat: bytes={}, tipus={}, id={}, rndom={}, dades={}'.format(bytes_sent, 
                                                                                  get_name_of_packet_type(packet_content[0]), 
                                                                                  *packet_content))
@@ -99,23 +97,24 @@ def send_packet_udp(udp_sock, udp_address, packet, packet_content, new_state=Non
         cl_state = new_state
         logging.info('Dispositiu passa a l\'estat {}'.format(get_name_of_state(new_state)))
         
+        #SECTION: HE CANVIAT AIXO
 def receive_packet_udp(ready_to_read):
-    recv_bytes = ready_to_read[0].recvfrom(REG_ALIVE_PACKET_SIZE)
-    recv_packet = UDP_Packet(*(get_relevant_sequence_of_bytes(elem) if isinstance(elem, bytes) else elem for elem in struct.unpack(UDP_PACKET_FORMAT, recv_bytes[0])))
-    logging.debug('Rebut: bytes={}, tipus={}, id={}, rndom={}, dades={}'.format(len(recv_bytes[0]), 
+    recv_bytes, recv_addr = ready_to_read[0].recvfrom(REG_ALIVE_PACKET_SIZE)
+    recv_packet = UDP_Packet(*(get_relevant_sequence_of_bytes(elem) if isinstance(elem, bytes) else elem for elem in struct.unpack(UDP_PACKET_FORMAT, recv_bytes)))
+    logging.debug('Rebut: bytes={}, tipus={}, id={}, rndom={}, dades={}'.format(len(recv_bytes), 
                                                                                     get_name_of_packet_type(recv_packet.t_pack), 
                                                                                     recv_packet.id, 
                                                                                     recv_packet.rand_num, 
                                                                                     get_relevant_sequence_of_bytes(recv_packet.data)))
-    return recv_packet, socket.gethostbyname(recv_bytes[1][0])
+    return recv_packet, socket.gethostbyname(recv_addr[0])
 
 def send_reg_req_packet_until_servers_response(udp_sock):
     global cl_state, rcv_reg_info, reg_process_info
     packet_content = (REG_REQ, (cfg_file_info['Id']+'\0').encode('ascii'), '00000000\0'.encode('ascii'), '\0'.encode('ascii'))
     packet = struct.pack(UDP_PACKET_FORMAT, *packet_content)
     udp_address = (cfg_file_info['Server'], int(cfg_file_info['Server-UDP']))
-    reg_ack_rcvd = False
-    while not reg_ack_rcvd and (cl_state == NOT_REGISTERED or cl_state == WAIT_ACK_REG):
+    reg_ack_recvd = False
+    while not reg_ack_recvd and (cl_state == NOT_REGISTERED or cl_state == WAIT_ACK_REG):
         if num_max_process < reg_process_info['num_reg_proc']:
             udp_sock.close()
             logging.info('Superat el nombre de processos de registre (%d)', num_max_process)
@@ -140,7 +139,7 @@ def send_reg_req_packet_until_servers_response(udp_sock):
                         rcv_reg_info['IP_address'] = server_address        #CUIDADO: Amb aixó duplico la ip del servidor (¿fa falta?) 
                         rcv_reg_info['Random_number'] = recv_packet.rand_num
                         rcv_reg_info['Final_UDP'] = get_relevant_sequence_of_bytes(recv_packet.data)
-                        reg_ack_rcvd = True
+                        reg_ack_recvd = True
             else:
                 cl_state = NOT_REGISTERED
                 if (first_packets_threshold <= reg_process_info['counter'] and 
@@ -187,7 +186,7 @@ def complete_registration(udp_sock):
         cl_state = NOT_REGISTERED
     else:
         recv_packet, server_address = receive_packet_udp(ready_to_read)
-        if check_valid_identity(recv_packet) and check_valid_address(server_address[0]):
+        if check_valid_identity(recv_packet) and check_valid_address(server_address):
             if recv_packet.t_pack == INFO_ACK:                        
                 logging.info('Rebut INFO_ACK, passant a estat REGISTERED')
                 rcv_reg_info['Server-TCP'] = get_relevant_sequence_of_bytes(recv_packet.data)
@@ -237,7 +236,7 @@ def receive_first_alive_packet(udp_sock):
     else:
         recv_packet, server_address = receive_packet_udp(ready_to_read)
         if (check_valid_identity(recv_packet) and 
-            check_valid_address(server_address[0]) and
+            check_valid_address(server_address) and
             get_relevant_sequence_of_bytes(recv_packet.data) ==  cfg_file_info['Id'].encode('ascii')):
             if recv_packet.t_pack == ALIVE:
                 cl_state = SEND_ALIVE
@@ -492,7 +491,6 @@ def main():
         receive_first_alive_th.setDaemon(True)
         send_cmd_th = threading.Thread(target=run_command_line)
         send_cmd_th.setDaemon(True)
-        #TODO: Has de comensar la rebuda de comandes del servidor i fer que el primer send alive te retorni un socket tcp de ptm
         send_alive_packet(udp_sock)
         receive_first_alive_th.start()
         receive_first_alive_th.join()

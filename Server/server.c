@@ -4,6 +4,7 @@ PARSED_ARGS get_parsed_arguments(int argc, char **argv);
 CFG_PARAMS get_parsed_configuration_file_params(PARSED_ARGS args);
 NODE *get_valid_devices(char *bbdd_dev_name);
 UDP_PACKET create_udp_packet(unsigned char p_type, char *rand_num, char *data);
+TCP_PACKET create_tcp_packet(unsigned char p_type, char *rand_num, char *elem, char *value, char *info);
 DEVICE *get_device_from_id(char *id);
 DATA_REG_INFO parse_data_of_reg_info_packet(char *data);
 int check_if_device_is_registered_in_bbdd(char *new_device_id);
@@ -11,6 +12,12 @@ int check_if_given_bytes_are_the_expected(char *given, char *expected);
 int is_id_registered(DEVICE *current_dvc, char *id);
 int is_address_and_port_valid(DEVICE *current_dvc, struct sockaddr_in addr_cli);
 int is_random_number_and_data_valid(UDP_PACKET *recv_packet, char *expected_rand_num, char *expected_data);
+/*int check_if_reg_info_data_is_valid(UDP_PACKET *recv_packet);*/
+int check_if_elem_is_valid(char *elem);
+int check_if_device_has_elem(char *dvc_elem, char *elem);
+int check_if_input_is_set(char *input);
+int check_if_all_elems_are_valid(char *elems);
+int check_if_tcp_port_is_valid(int tcp_port);
 void store_id_to_linked_list(struct NODE **head, char *id);
 void print_all_devices(NODE *head);
 void free_all_reserved(NODE *head, int shm_id_run_server);
@@ -19,16 +26,28 @@ void run_cli(char *input);
 void process_udp_packet(char *packet, struct sockaddr_in addr_cli);
 void process_register_request(UDP_PACKET *recv_packet, struct sockaddr_in addr_cli);
 void send_reg_ack(DEVICE *current_dvc, int udp_sock_fd);
-void send_udp_packet(DEVICE *current_dvc, int udp_sock_fd, unsigned char p_type, char *data);
+/*void send_udp_packet(DEVICE *current_dvc, int udp_sock_fd, unsigned char p_type, char *data);*/
+void send_udp_packet(char *rand_num, struct sockaddr_in udp_addr, int udp_sock_fd, unsigned char p_type, char *data);
 void process_alive(UDP_PACKET *recv_packet, struct sockaddr_in addr_cli);
-void process_unwanted_packet_type(UDP_PACKET *recv_packet);
-void proceed_final_stage_registration(DEVICE *current_dvc, UDP_PACKET *recv_packet, int new_udp_sock);
+void process_unwanted_packet_type(char *id, unsigned char p_type);
+void proceed_final_stage_registration(DEVICE *current_dvc, DATA_REG_INFO parsed_info_data, int new_udp_sock);
 void proceed_registration(DEVICE *current_dvc, int new_udp_sock, struct sockaddr_in addr_cli);
 void disconnect_device(DEVICE *current_dvc);
 void run_alive_checker();
 void receive_first_alive_from_client(DEVICE *current_dvc);
 void finish_signal_handler(int sig);
 void keyboard_shutdown_signal_handler(int sig);
+void print_recvd_udp_packet(UDP_PACKET *recv_packet);
+void process_tcp_packet(char *packet, int new_tcp_sock);
+void print_recvd_tcp_packet(TCP_PACKET *recv_packet);
+void send_tcp_packet(char *rand_num, int tcp_sock_fd, unsigned char p_type, char *elem, char *value, char *info);
+void process_send_data(TCP_PACKET *recv_packet, int new_tcp_sock);
+void cli_to_controller_signal_handler(int sig);
+void final_step_tcp_packet(DEVICE *current_dvc, char *elem, char *value, unsigned char p_type);
+void proceed_tcp(unsigned char p_type, char *elem, char *value, DEVICE *current_dvc);
+void process_tcp_interaction(char *token);
+void append_to_device_log(DEVICE *current_dvc, TCP_PACKET *recv_packet);
+void process_device_tcp_reply(DEVICE *current_dvc, TCP_PACKET *packet_recvd);
 
 PARSED_ARGS args;
 CFG_PARAMS cfg;
@@ -36,13 +55,14 @@ NODE *head;
 int *run_server;
 int main_udp_sock_fd;
 int main_tcp_sock_fd;
+int shm_id_run_server;
 
 int main(int argc, char **argv)
 {
     char msg_buffer[BUFF_SIZE];
     char input[BUFF_SIZE];
-    int shm_id_run_server;
     int ch_pid;
+    /*struct sigaction kill_sig;*/
     shm_id_run_server = shmget(IPC_PRIVATE, sizeof(int *), IPC_CREAT | 0666);
     run_server = (int *)shmat(shm_id_run_server, NULL, 0);
     *run_server = 1;
@@ -52,12 +72,15 @@ int main(int argc, char **argv)
     cfg = get_parsed_configuration_file_params(args);
     head = get_valid_devices(args.bbddname);
     print_all_devices(head);
-    main_tcp_sock_fd = setup_tcp_socket(cfg.tcp_port);
+    main_tcp_sock_fd = setup_tcp_socket(cfg.tcp_port, 1);
+    print_debug_message("socket tcp actiu", args.dflag);
     main_udp_sock_fd = setup_udp_socket(cfg.udp_port);
+    print_debug_message("socket udp actiu", args.dflag);
     /*  CLI         */
     ch_pid = fork();
     if (ch_pid == 0)
     {
+        signal(SIGUSR1, finish_signal_handler);
         printf("CLI %d\n", getpid());
         run_cli(input);
     }
@@ -70,6 +93,7 @@ int main(int argc, char **argv)
     ch_pid = fork();
     if (ch_pid == 0)
     {
+        signal(SIGUSR1, finish_signal_handler);
         printf("UDP/TCP %d\n", getpid());
         listen_to_packets();
         exit(0);
@@ -84,6 +108,7 @@ int main(int argc, char **argv)
     ch_pid = fork();
     if (ch_pid == 0)
     {
+        signal(SIGUSR1, finish_signal_handler);
         printf("Send Alive %d\n", getpid());
         run_alive_checker();
         exit(0);
@@ -93,14 +118,20 @@ int main(int argc, char **argv)
         perror("fork");
         exit(-1);
     }
+    /* kill_sig.sa_handler = keyboard_shutdown_signal_handler;
+    kill_sig.sa_flags = 0;
+    sigemptyset(&kill_sig.sa_mask);
+    sigaction(SIGINT, &kill_sig, NULL);*/
     signal(SIGINT, keyboard_shutdown_signal_handler);
+    signal(SIGUSR2, cli_to_controller_signal_handler);
+    signal(SIGCHLD, SIG_IGN);
+    signal(SIGUSR1, SIG_IGN);
     printf("Control %d\n", getpid());
     while (*run_server)
     {
+        pause();
     }
-    signal(SIGCHLD, SIG_IGN);
-    signal(SIGUSR1, SIG_IGN);
-    kill(-1*getpid(), SIGUSR1);
+    kill(0, SIGUSR1);
     close(main_udp_sock_fd);
     close(main_tcp_sock_fd);
     free_all_reserved(head, shm_id_run_server);
@@ -109,17 +140,26 @@ int main(int argc, char **argv)
 
 void finish_signal_handler(int sig)
 {
-    if (sig == SIGUSR1)
-    {
-        exit(0);
-    }
+    /*    signal(SIGUSR1, finish_signal_handler);*/
+    exit(0);
 }
-
+/*TODO: CANVIAR TOTS ELS PRINTF PER A FPRINTF*/
 void keyboard_shutdown_signal_handler(int sig)
 {
-    if (sig == SIGINT){
-        run_server = 0;
-    }
+    /*signal(SIGINT, keyboard_shutdown_signal_handler);*/
+    run_server = 0;
+    kill(0, SIGUSR1);
+    close(main_udp_sock_fd);
+    close(main_tcp_sock_fd);
+    free_all_reserved(head, shm_id_run_server);
+    fprintf(stdout, "S'ha presionat ctr + c\n");
+    exit(0);
+}
+
+void cli_to_controller_signal_handler(int sig)
+{
+    /*    signal(SIGUSR2, cli_to_controller_signal_handler);*/
+    fprintf(stdout, "Senyal de finalització del servidor enviada al controlador\n");
 }
 
 /**
@@ -129,24 +169,29 @@ void keyboard_shutdown_signal_handler(int sig)
 void run_alive_checker()
 {
     NODE *node;
-    struct timeval tv;
-
+    char msg_buffer[BUFF_SIZE];
+    time_t current_time;
     while (*run_server)
     {
         node = head;
-        tv.tv_sec = 2;
+        /*tv.tv_sec = TIME_BETWEEN_ALIVES;
         tv.tv_usec = 0;
-        select(0, NULL, NULL, NULL, &tv);
-        printf("SEGUNDO\n");
+        select(0, NULL, NULL, NULL, &tv);*/
+        current_time = time(NULL);
         while (*run_server && (*node).dvc != NULL)
         {
-            printf("%s %s\n", (*(*node).dvc).id, get_state_name((*(*node).dvc).state));
-            if ((*(*node).dvc).state == SEND_ALIVE)
+            if ((*(*node).dvc).state == SEND_ALIVE && (((*(*node).dvc).time_last_alive + TIME_BETWEEN_ALIVES) <= current_time))
             {
+                printf("->>>>>>>>>>>>>%s\n", (*(*node).dvc).elems);
                 (*(*node).dvc).alive_counter += 1;
+                (*(*node).dvc).time_last_alive = time(NULL);
+                sprintf(msg_buffer, "Dispositiu %s porta %d pendents", (*(*node).dvc).id, (*(*node).dvc).alive_counter);
+                print_debug_message(msg_buffer, args.dflag);
                 if ((*(*node).dvc).alive_counter == MAX_ALIVE_COUNTER)
                 {
-                    (*(*node).dvc).state = DISCONNECTED;
+                    sprintf(msg_buffer, "Dispositiu %s ha excedit el màxim numero de alives pendents [%d]", (*(*node).dvc).id, MAX_ALIVE_COUNTER);
+                    print_debug_message(msg_buffer, args.dflag);
+                    disconnect_device((*node).dvc);
                     (*(*node).dvc).alive_counter = 0;
                 }
             }
@@ -157,18 +202,35 @@ void run_alive_checker()
 
 void run_cli(char *input)
 {
+    int pid;
+    char buffer[BUFF_SIZE];
+    char *token;
+    char *delim = " ";
     while (*run_server)
     {
         if (fgets(input, BUFF_SIZE, stdin))
         {
-            if (!strcmp(trim_string(input), "quit"))
+            strcpy(buffer, input);
+            buffer[BUFF_SIZE] = '\0';
+            token = strtok(buffer, delim);
+            if (!strcmp(trim_string(token), "quit"))
             {
-                printf("Comanda reconeguda (%s)\n", input);
+                printf("Comanda reconeguda (%s)\n", trim_string(token));
+                kill(getppid(), SIGUSR2);
                 *run_server = 0;
             }
-            else if (!strcmp(trim_string(input), "list"))
+            else if (strcmp(trim_string(token), "list") == 0)
             {
                 print_all_devices(head);
+            }
+            else if (strcmp(trim_string(token), "set") == 0 || strcmp(trim_string(token), "get") == 0)
+            {
+                pid = fork();
+                if (pid == 0)
+                {
+                    process_tcp_interaction(token);
+                    exit(0);
+                }
             }
             else
             {
@@ -182,7 +244,212 @@ void run_cli(char *input)
     }
     exit(0);
 }
+/*set GHX0E32LWQ6C LUM-0-I hola*/
+void process_tcp_interaction(char *token)
+{
+    DEVICE *current_dvc;
+    unsigned char p_type;
+    char msg_buffer[BUFF_SIZE];
+    char *cmd;
+    char *id;
+    char *elem;
+    char *value;
+    char *delim = " ";
+    cmd = token;
+    id = strtok(NULL, delim);
+    if (id == NULL)
+    {
+        print_debug_message("Comanda mal formada.", args.dflag);
+        exit(0);
+    }
+    current_dvc = get_device_from_id(id);
+    if (current_dvc != NULL)
+    {
+        elem = strtok(NULL, delim);
+        if (elem == NULL)
+        {
+            print_debug_message("Comanda mal formada.", args.dflag);
+            exit(0);
+        }
+        elem = trim_string(elem);
+        if (strcmp(trim_string(cmd), "set") == 0)
+        {
+            p_type = SET_DATA;
+            value = strtok(NULL, delim);
+            if (value == NULL)
+            {
+                print_debug_message("Comanda mal formada.", args.dflag);
+                exit(0);
+            }
+            value = trim_string(value);
+        }
+        else
+        {
+            p_type = GET_DATA;
+            value = "";
+        }
+        proceed_tcp(p_type, elem, value, current_dvc);
+    }
+    else
+    {
+        sprintf(msg_buffer, "Dispositiu amb id \"%s\" no està registrat.", id);
+        print_debug_message(msg_buffer, args.dflag);
+    }
+}
 
+void proceed_tcp(unsigned char p_type, char *elem, char *value, DEVICE *current_dvc)
+{
+    char msg_buffer[BUFF_SIZE];
+    if ((*current_dvc).state == SEND_ALIVE)
+    {
+        if (check_if_device_has_elem((*current_dvc).elems, elem))
+        {
+            if (is_str_alphanumeric(value) && sizeof(value) <= 15)
+            {
+                final_step_tcp_packet(current_dvc, elem, value, p_type);
+            }
+            else
+            {
+                sprintf(msg_buffer, "Comanda incorrecta: El valor no té el format adeqüat.");
+                print_debug_message(msg_buffer, args.dflag);
+            }
+        }
+        else
+        {
+            sprintf(msg_buffer, "Comanda incorrecta: Dispositiu no té l'element.");
+            print_debug_message(msg_buffer, args.dflag);
+        }
+    }
+    else
+    {
+        sprintf(msg_buffer, "Comanda incorrecta: Dispositiu no està amb estat SEND_ALIVE.");
+        print_debug_message(msg_buffer, args.dflag);
+    }
+}
+
+void final_step_tcp_packet(DEVICE *current_dvc, char *elem, char *value, unsigned char p_type)
+{
+    int new_tcp_sock;
+    int e_code;
+    int bytes_recv;
+    int sock_fd;
+    char msg_buffer[BUFF_SIZE];
+    TCP_PACKET packet_recvd;
+    fd_set sock_set; /*NOM PENDENT DE REVISIÓ*/
+    struct timeval tv;
+    tv.tv_sec = 2; /*TODO: S'HAN DE FICAR TOTS ELS TEMPS D'ESPERA EN CONSTANTS*/
+    tv.tv_usec = 0;
+    new_tcp_sock = setup_tcp_socket(0, 0);
+    e_code = connect(new_tcp_sock, (struct sockaddr *)&(*current_dvc).tcp_addr, sizeof(struct sockaddr_in));
+    if (e_code < 0)
+    {
+        sprintf(msg_buffer, "No s'ha pogut conectar al socket tcp del dispositiu.");
+        print_debug_message(msg_buffer, args.dflag);
+        disconnect_device(current_dvc);
+    }
+    else
+    {
+        send_tcp_packet((*current_dvc).rand_num, new_tcp_sock, p_type, elem, value, (*current_dvc).id);
+        FD_ZERO(&sock_set);
+        FD_SET(new_tcp_sock, &sock_set);
+        sock_fd = select(FD_SETSIZE, &sock_set, NULL, NULL, &tv);
+        if (0 < sock_fd)
+        {
+
+            bytes_recv = recv(new_tcp_sock, (char *)&packet_recvd, PDU_TCP_SIZE, 0);
+            if (bytes_recv == PDU_TCP_SIZE)
+            {
+                process_device_tcp_reply(current_dvc, &packet_recvd);
+            }
+            else
+            {
+                sprintf(msg_buffer, "Resposta del dispositiu no rebuda.");
+                print_debug_message(msg_buffer, args.dflag);
+            }
+        }
+        else
+        {
+            sprintf(msg_buffer, "Resposta del dispositiu no rebuda.");
+            print_debug_message(msg_buffer, args.dflag);
+        }
+    }
+    close(new_tcp_sock);
+}
+
+/*
+        packet_to_send = create_tcp_packet(p_type, (*current_dvc).rand_num, elem, value, (*current_dvc).id);
+        bytes_sent = send(new_tcp_sock, &packet_to_send, sizeof(packet_to_send), 0);
+        if (bytes_sent < 0)
+        {
+            perror("send tcp");
+            exit(1);
+        }
+        FD_ZERO(&sock_set);
+        FD_SET(new_tcp_sock, &sock_set);
+        sock_fd = select(FD_SETSIZE, &sock_set, NULL, NULL, &tv);
+        if (0 < sock_fd)
+        {
+            bytes_recv = recv(new_tcp_sock, (char *)&packet_recvd, PDU_TCP_SIZE, 0);
+            process_device_tcp_reply(current_dvc, &packet_recvd);
+        }
+        else
+        {
+            sprintf(msg_buffer, "Resposta del dispositiu no rebuda.");
+            print_debug_message(msg_buffer, args.dflag);
+        }
+
+*/
+
+void process_device_tcp_reply(DEVICE *current_dvc, TCP_PACKET *packet_recvd)
+{
+    char msg_buffer[BUFF_SIZE];
+    print_recvd_tcp_packet(packet_recvd);
+    if (strcmp((*current_dvc).id, (*packet_recvd).id) == 0)
+    {
+        if (strcmp((*current_dvc).rand_num, (*packet_recvd).rand_num) == 0)
+        {
+            if (check_if_device_has_elem((*current_dvc).elems, (*packet_recvd).element))
+            {
+                switch ((*packet_recvd).p_type)
+                {
+                case DATA_ACK:
+                    append_to_device_log(current_dvc, packet_recvd);
+                    /*TODO: S'haurie d'acabar de ficar missatges de completacio d'accions*/
+                    break;
+                case DATA_NACK:
+                    sprintf(msg_buffer, "Obtenció de dades del client incorrecta.");
+                    print_debug_message(msg_buffer, args.dflag);
+                    break;
+                case DATA_REJ:
+                    disconnect_device(current_dvc);
+                    break;
+                default:
+                    process_unwanted_packet_type((*current_dvc).id, (*packet_recvd).p_type);
+                    break;
+                }
+            }
+            else
+            {
+                sprintf(msg_buffer, "Element no registrat en el dispositiu: %s (rebut elem: %s)", (*current_dvc).elems, (*packet_recvd).element);
+                print_debug_message(msg_buffer, args.dflag);
+            }
+        }
+        else
+        {
+            sprintf(msg_buffer, "Error en les dades d'identificació del dispositiu: %s (rebut id:%s, rndm:%s)", (*packet_recvd).id, (*current_dvc).id, (*current_dvc).rand_num);
+            print_debug_message(msg_buffer, args.dflag);
+            disconnect_device(current_dvc);
+        }
+    }
+    else
+    {
+        sprintf(msg_buffer, "Error en les dades d'identificació del dispositiu: %s (rebut id:%s, rndm:%s)", (*packet_recvd).id, (*current_dvc).id, (*current_dvc).rand_num);
+        print_debug_message(msg_buffer, args.dflag);
+        disconnect_device(current_dvc);
+    }
+}
+
+/*SECTION: LISTEN TO PACKETS*/
 void listen_to_packets()
 {
     int pid;
@@ -193,19 +460,19 @@ void listen_to_packets()
     fd_set sock_set; /*NOM PENDENT DE REVISIÓ*/
     socklen_t len;
     struct sockaddr_in addr_cli;
-    struct timeval tv;
+    /*struct timeval tv;
     tv.tv_sec = 0;
-    tv.tv_usec = 0;
+    tv.tv_usec = 0;*/
     printf("udp %d tcp %d\n", main_udp_sock_fd, main_tcp_sock_fd);
     while (*run_server)
     {
         FD_ZERO(&sock_set);
         FD_SET(main_tcp_sock_fd, &sock_set);
         FD_SET(main_udp_sock_fd, &sock_set);
-        select(FD_SETSIZE, &sock_set, NULL, NULL, &tv);
+        select(FD_SETSIZE, &sock_set, NULL, NULL, NULL);
         if (FD_ISSET(main_udp_sock_fd, &sock_set))
         {
-            printf("It's udp!\n");
+            /*printf("It's udp!\n");*/
             pid = fork();
             if (pid == 0)
             {
@@ -217,13 +484,12 @@ void listen_to_packets()
                 if (bytes_recv == PDU_UDP_SIZE)
                 {
                     process_udp_packet(udp_buffer, addr_cli);
-                    /*addr_cli, udp_buffer, device linked list*/
-                    printf("All bytes recv\n");
+                    printf("All bytes recv in udp\n");
                 }
                 else
                 {
-                    printf("Some problem with bytes\n"); /*TODO: Same with Python, when receive not all the packet, listen for more, thats the idea*/
-                                                         /*Ignorar paquet i PUNTO*/
+                    printf("Some problem with bytes\n");
+                    /*Ignorar paquet i PUNTO*/
                 }
                 exit(0);
             }
@@ -234,7 +500,7 @@ void listen_to_packets()
         }
         if (FD_ISSET(main_tcp_sock_fd, &sock_set))
         {
-            printf("It's tcp!\n");
+            /*printf("It's tcp!\n");*/
             pid = fork();
             if (pid == 0)
             {
@@ -251,12 +517,13 @@ void listen_to_packets()
                 if (bytes_recv == PDU_TCP_SIZE)
                 {
                     /*addr_cli, udp_buffer, device linked list*/
-                    printf("All bytes recv in \n");
+                    process_tcp_packet(tcp_buffer, aux_tcp_sock);
+                    printf("All bytes recv in tcp\n");
                 }
                 else
                 {
-                    printf("Some problem with bytes\n"); /*TODO: Same with Python, when receive not all the packet, listen for more, thats the idea*/
-                                                         /*Ignorar paquet i PUNTO*/
+                    printf("Some problem with bytes\n");
+                    /*Ignorar paquet i PUNTO*/
                 }
                 exit(0);
             }
@@ -271,11 +538,106 @@ void listen_to_packets()
     exit(0);
 }
 
+void process_tcp_packet(char *packet, int new_tcp_sock)
+{
+    TCP_PACKET *recv_packet = (TCP_PACKET *)packet;
+    unsigned char current_packet_type = (*recv_packet).p_type;
+    print_recvd_tcp_packet(recv_packet);
+    switch (current_packet_type)
+    {
+    case SEND_DATA:
+        process_send_data(recv_packet, new_tcp_sock);
+        break;
+    default:
+        process_unwanted_packet_type((*recv_packet).id, (*recv_packet).p_type);
+        break;
+    }
+}
+
+void process_send_data(TCP_PACKET *recv_packet, int new_tcp_sock)
+{
+    char msg_buffer[BUFF_SIZE];
+    TCP_PACKET packet_to_send;
+    DEVICE *current_dvc = get_device_from_id((*recv_packet).id);
+    if (current_dvc != NULL)
+    {
+        if (strcmp((*recv_packet).rand_num, (*current_dvc).rand_num) == 0)
+        {
+            if ((*current_dvc).state == SEND_ALIVE)
+            {
+                if (check_if_device_has_elem((*current_dvc).elems, (*recv_packet).element))
+                {
+                    append_to_device_log(current_dvc, &packet_to_send);
+                    send_tcp_packet((*current_dvc).rand_num, new_tcp_sock, DATA_ACK, (*recv_packet).element, (*recv_packet).value, (*current_dvc).id);
+                }
+                else
+                {
+                    sprintf(msg_buffer, "L'element enviat no pertany al dispositiu.");
+                    print_debug_message(msg_buffer, args.dflag);
+                    send_tcp_packet((*current_dvc).rand_num, new_tcp_sock, DATA_NACK, (*recv_packet).element, (*recv_packet).value, "L'element enviat no pertany al dispositiu,");
+                }
+            }
+            else
+            {
+                sprintf(msg_buffer, "Estat del dispositiu incorrecte.");
+                print_debug_message(msg_buffer, args.dflag);
+                send_tcp_packet((*current_dvc).rand_num, new_tcp_sock, DATA_REJ, (*recv_packet).element, (*recv_packet).value, "Estat del dispositiu incorrecte,");
+            }
+        }
+        else
+        {
+            sprintf(msg_buffer, "Dispositiu ha enviat numero aleatori incorrecte.");
+            print_debug_message(msg_buffer, args.dflag);
+            send_tcp_packet((*current_dvc).rand_num, new_tcp_sock, DATA_REJ, (*recv_packet).element, (*recv_packet).value, "Dispositiu ha enviat numero aleatori incorrecte.");
+        }
+    }
+    else
+    {
+        sprintf(msg_buffer, "Dispositiu amb id \"%s\" no està registrat.", (*recv_packet).id);
+        print_debug_message(msg_buffer, args.dflag);
+        send_tcp_packet("00000000", new_tcp_sock, DATA_REJ, (*recv_packet).element, (*recv_packet).value, "Dispositiu no està registrat en el servidor");
+    }
+}
+/*
+
+        packet_to_send = create_tcp_packet(DATA_REJ, "00000000", (*recv_packet).element, (*recv_packet).value, "Dispositiu no està registrat en el servidor.");
+        bytes_sent = send(new_tcp_sock, &packet_to_send, sizeof(packet_to_send), 0);
+        if (bytes_sent < 0)
+        {
+            perror("send tcp");
+        }
+
+*/
+
+void append_to_device_log(DEVICE *current_dvc, TCP_PACKET *recv_packet)
+{
+    FILE *log_ptr;
+    time_t now;
+    struct tm *local;
+    char msg_buffer[BUFF_SIZE];
+
+    time(&now);
+    local = localtime(&now);
+    sprintf(msg_buffer, "./%s.data", (*current_dvc).id);
+    log_ptr = fopen(msg_buffer, "a");
+    sprintf(msg_buffer, "%d:%d:%d;%d:%d:%d;%s;%s;%s\n", (*local).tm_year, /*TODO: L'hora no es mostra correctament, arreglar-ho*/
+            (*local).tm_mon,
+            (*local).tm_mday,
+            (*local).tm_hour,
+            (*local).tm_min,
+            (*local).tm_sec,
+            get_packet_type_name((*recv_packet).p_type),
+            (*recv_packet).element,
+            (*recv_packet).value);
+    fputs(msg_buffer, log_ptr);
+    fclose(log_ptr);
+}
+
 void process_udp_packet(char *packet, struct sockaddr_in addr_cli)
 {
     UDP_PACKET *recv_packet = (UDP_PACKET *)packet;
     unsigned char current_packet_type = (*recv_packet).p_type;
-    printf("packet type: %s\n", get_packet_type_name(current_packet_type)); /*TODO: DEV PRINT, s'ha de borrar*/
+    print_recvd_udp_packet(recv_packet);
     switch (current_packet_type)
     {
     case REG_REQ:
@@ -285,7 +647,7 @@ void process_udp_packet(char *packet, struct sockaddr_in addr_cli)
         process_alive(recv_packet, addr_cli);
         break;
     default:
-        process_unwanted_packet_type(recv_packet);
+        process_unwanted_packet_type((*recv_packet).id, (*recv_packet).p_type);
         break;
     }
 }
@@ -296,47 +658,57 @@ void process_alive(UDP_PACKET *recv_packet, struct sockaddr_in addr_cli)
     DEVICE *current_dvc = get_device_from_id((*recv_packet).id);
     if (current_dvc != NULL)
     {
-        /*TODO: Pensar si separ(ar aquestes dos comprovacions, me fa bastant pal la verdad*/
-        printf("%d %d\n", is_random_number_and_data_valid(recv_packet, (*current_dvc).rand_num, ""), is_address_and_port_valid(current_dvc, addr_cli));
-        if (is_random_number_and_data_valid(recv_packet, (*current_dvc).rand_num, "") && is_address_and_port_valid(current_dvc, addr_cli))
+        if ((*current_dvc).state == SEND_ALIVE || (*current_dvc).state == REGISTERED)
         {
-            if ((*current_dvc).state == SEND_ALIVE || (*current_dvc).state == REGISTERED)
+            if (is_address_and_port_valid(current_dvc, addr_cli))
             {
-                if ((*current_dvc).state == REGISTERED)
+                /*TODO: Pensar si separ(ar aquestes dos comprovacions, me fa bastant pal la verdad*/
+                if (is_random_number_and_data_valid(recv_packet, (*current_dvc).rand_num, ""))
                 {
-                    (*current_dvc).state = SEND_ALIVE;
+
+                    if ((*current_dvc).state == REGISTERED)
+                    {
+                        (*current_dvc).state = SEND_ALIVE;
+                        sprintf(msg_buffer, "Dispositiu amb id \"%s\" passa a estat SEND_ALIVE.", (*current_dvc).id);
+                        print_info_message(msg_buffer);
+                    }
+                    send_udp_packet((*current_dvc).rand_num, (*current_dvc).udp_addr, main_udp_sock_fd, ALIVE, (*current_dvc).id);
+                    (*current_dvc).alive_counter = 0;
+                    (*current_dvc).time_last_alive = time(NULL);
                 }
-                send_udp_packet(current_dvc, main_udp_sock_fd, ALIVE, (*current_dvc).id);
-                (*current_dvc).alive_counter = 0;
+                else
+                {
+                    printf("problem with data, rand_num\n");
+                    send_udp_packet((*current_dvc).rand_num, (*current_dvc).udp_addr, main_udp_sock_fd, ALIVE_REJ, "");
+                    disconnect_device(current_dvc);
+                }
             }
             else
             {
-                printf("problem with state\n");
-                send_udp_packet(current_dvc, main_udp_sock_fd, ALIVE_REJ, "");
+                printf("problem with addres, port\n");
+                send_udp_packet((*current_dvc).rand_num, addr_cli, main_udp_sock_fd, ALIVE_REJ, "");
                 disconnect_device(current_dvc);
-                /*TODO: ENVIAR ALIVE_REJ AQUI I MES ABAIX*/
             }
         }
         else
         {
-            printf("problem with data, rand_num, addres, port\n");
-            send_udp_packet(current_dvc, main_udp_sock_fd, ALIVE_REJ, "");
+            printf("problem with state\n");
+            send_udp_packet((*current_dvc).rand_num, addr_cli, main_udp_sock_fd, ALIVE_REJ, "");
             disconnect_device(current_dvc);
         }
     }
     else
     {
-        printf("la id no existeix weón\n");
         sprintf(msg_buffer, "Dispositiu amb id \"%s\" no està registrat.", (*recv_packet).id);
         print_info_message(msg_buffer);
     }
 }
 
-void process_unwanted_packet_type(UDP_PACKET *recv_packet)
+void process_unwanted_packet_type(char *id, unsigned char p_type)
 {
     char msg_buffer[BUFF_SIZE];
-    DEVICE *current_dvc = get_device_from_id((*recv_packet).id);
-    sprintf(msg_buffer, "Tipus de paquet no permés [%s].", get_packet_type_name((*recv_packet).p_type));
+    DEVICE *current_dvc = get_device_from_id(id);
+    sprintf(msg_buffer, "Tipus de paquet no permés [%s].", get_packet_type_name(p_type));
     print_debug_message(msg_buffer, args.dflag);
     if (current_dvc != NULL)
     {
@@ -349,11 +721,12 @@ void process_register_request(UDP_PACKET *recv_packet, struct sockaddr_in addr_c
     int new_udp_sock;
     char msg_buffer[BUFF_SIZE];
     DEVICE *current_dvc = get_device_from_id((*recv_packet).id);
+    new_udp_sock = setup_udp_socket(0);
     if (current_dvc != NULL)
     {
-        new_udp_sock = setup_udp_socket(0);
         if ((*current_dvc).state == DISCONNECTED)
         { /*TODO: Mirar si el port està en el rang correcte*/
+            /*TODO: ELIMINAR AQUESTES FUNCIONS DE COMPROVACIONS BASTANT OBVIEs*/
             if (is_random_number_and_data_valid(recv_packet, "00000000", ""))
             {
                 proceed_registration(current_dvc, new_udp_sock, addr_cli);
@@ -362,15 +735,16 @@ void process_register_request(UDP_PACKET *recv_packet, struct sockaddr_in addr_c
             {
                 sprintf(msg_buffer, "Dispositiu amb id \"%s\" ha enviat paquet amb dades erronees.", (*recv_packet).id);
                 print_info_message(msg_buffer);
-                send_udp_packet(current_dvc, new_udp_sock, REG_REJ, "Informació rebuda del paquet incorrecta");
+                send_udp_packet((*current_dvc).rand_num, addr_cli, new_udp_sock, REG_REJ, "Informació rebuda del paquet incorrecta");
                 disconnect_device(current_dvc);
             }
         }
         else
         {
-            sprintf(msg_buffer, "Dispositiu amb id \"%s\" passa a estat DISCONNECTED.", (*recv_packet).id);
+            printf("ESTAT ACTUAL (%s)\n", get_state_name((*current_dvc).state));
+            sprintf(msg_buffer, "Dispositiu amb id \"%s\" ha enviat paquet de registre sense estar en estat DISCONNECTED.", (*recv_packet).id);
             print_info_message(msg_buffer);
-            send_udp_packet(current_dvc, new_udp_sock, REG_REJ, "Estat incorrecte");
+            send_udp_packet((*current_dvc).rand_num, addr_cli, new_udp_sock, REG_REJ, "Estat incorrecte");
             disconnect_device(current_dvc);
         }
         close(new_udp_sock);
@@ -379,6 +753,7 @@ void process_register_request(UDP_PACKET *recv_packet, struct sockaddr_in addr_c
     {
         sprintf(msg_buffer, "Dispositiu amb id \"%s\" no està registrat.", (*recv_packet).id);
         print_info_message(msg_buffer);
+        send_udp_packet("", addr_cli, new_udp_sock, REG_REJ, "Id no registrada");
     }
 }
 /*TODO: QUEDE MOLT REFACTORING I FICARHO WAPO*/
@@ -387,11 +762,13 @@ void proceed_registration(DEVICE *current_dvc, int new_udp_sock, struct sockaddr
     int bytes_recv;
     int sock_fd;
     char udp_buffer[PDU_UDP_SIZE];
+    char msg_buffer[BUFF_SIZE];
     fd_set sock_set;
+    DATA_REG_INFO parsed_info_data;
     socklen_t len;
     struct timeval tv;
-    UDP_PACKET *reg_info_packet;
-    (*current_dvc).cl_addr = addr_cli;
+    UDP_PACKET *recvd_packet;
+    (*current_dvc).udp_addr = addr_cli;
     tv.tv_sec = TIME_WAITING_FOR_REGISTER * TIMES_TO_WAIT_FOR_REG_INFO;
     tv.tv_usec = 0;
     FD_ZERO(&sock_set);
@@ -404,15 +781,36 @@ void proceed_registration(DEVICE *current_dvc, int new_udp_sock, struct sockaddr
         bytes_recv = recvfrom(new_udp_sock, udp_buffer, PDU_UDP_SIZE, 0, (struct sockaddr *)&addr_cli, &len);
         if (bytes_recv == PDU_UDP_SIZE)
         {
-            reg_info_packet = (UDP_PACKET *)udp_buffer;
-            if (check_if_given_bytes_are_the_expected((*reg_info_packet).id, (*current_dvc).id) && check_if_given_bytes_are_the_expected((*reg_info_packet).rand_num, (*current_dvc).rand_num) && is_address_and_port_valid(current_dvc, addr_cli))
+            recvd_packet = (UDP_PACKET *)udp_buffer;
+            print_recvd_udp_packet(recvd_packet);
+            if ((*recvd_packet).p_type == REG_INFO)
             {
-                proceed_final_stage_registration(current_dvc, reg_info_packet, new_udp_sock);
+                if (strcmp((*recvd_packet).id, (*current_dvc).id) == 0 && strcmp((*recvd_packet).rand_num, (*current_dvc).rand_num) == 0 && is_address_and_port_valid(current_dvc, addr_cli))
+                {
+                    parsed_info_data = parse_data_of_reg_info_packet((*recvd_packet).data);
+                    printf("----------%d %s\n", parsed_info_data.tcp_port, parsed_info_data.elems);
+                    if (check_if_all_elems_are_valid(parsed_info_data.elems) && check_if_tcp_port_is_valid(parsed_info_data.tcp_port))
+                    {
+                        proceed_final_stage_registration(current_dvc, parsed_info_data, new_udp_sock);
+                    }
+                    else
+                    {
+                        send_udp_packet((*current_dvc).rand_num, addr_cli, new_udp_sock, INFO_NACK, "Dades incorrectes");
+                        disconnect_device(current_dvc);
+                    }
+                }
+                else
+                {
+                    send_udp_packet((*current_dvc).rand_num, addr_cli, new_udp_sock, REG_REJ, "Dades d'dentificació incorrectes");
+                    disconnect_device(current_dvc);
+                }
             }
             else
             {
-                send_udp_packet(current_dvc, new_udp_sock, INFO_NACK, "Dades d'dentificació incorrectes");
-                printf("Enviament INFO_NACK\n");
+                sprintf(msg_buffer, "No hi ha hagut resposta del servidor");
+                print_debug_message(msg_buffer, args.dflag);
+                send_udp_packet((*current_dvc).rand_num, addr_cli, new_udp_sock, REG_REJ, "Dades d'dentificació incorrectes");
+                disconnect_device(current_dvc);
             }
         }
         else
@@ -422,28 +820,65 @@ void proceed_registration(DEVICE *current_dvc, int new_udp_sock, struct sockaddr
     }
     else
     {
-        (*current_dvc).state = DISCONNECTED;
-        printf("No ha llegao na, canvi d'estat!\n");
+        sprintf(msg_buffer, "No hi ha hagut resposta del servidor");
+        print_debug_message(msg_buffer, args.dflag);
+        disconnect_device(current_dvc);
     }
 }
 
-void proceed_final_stage_registration(DEVICE *current_dvc, UDP_PACKET *recv_packet, int new_udp_sock)
+void proceed_final_stage_registration(DEVICE *current_dvc, DATA_REG_INFO parsed_info_data, int new_udp_sock)
 {
     char msg_buffer[BUFF_SIZE];
     char packet_data[61];
-    DATA_REG_INFO parsed_info_data;
-    /*Fico en el struct de dos elements les dades del REG_INFO*/
-    /*Envio un INFO_ACK O INFO_NACK LO Q SEA*/
-    parsed_info_data = parse_data_of_reg_info_packet((*recv_packet).data);
-    (*current_dvc).tcp_port = parsed_info_data.tcp_port;
+    struct sockaddr_in cl_tcp_port;
+    cl_tcp_port.sin_family = AF_INET;
+    cl_tcp_port.sin_port = htons(parsed_info_data.tcp_port);
+    cl_tcp_port.sin_addr = (*current_dvc).udp_addr.sin_addr;
+    (*current_dvc).tcp_addr = cl_tcp_port; /*TODO: Aqui estic*/
     strcpy((*current_dvc).elems, parsed_info_data.elems);
     print_debug_message("Aixó és una prova pel debug", args.dflag);
-    sprintf(packet_data, "%d", (*current_dvc).tcp_port);
-    send_udp_packet(current_dvc, new_udp_sock, INFO_ACK, packet_data);
+    sprintf(packet_data, "%d", cfg.tcp_port);
+    send_udp_packet((*current_dvc).rand_num, (*current_dvc).udp_addr, new_udp_sock, INFO_ACK, packet_data);
     (*current_dvc).state = REGISTERED;
     sprintf(msg_buffer, "El client (%s) passa a l'estat REGISTERED", (*current_dvc).id);
     print_info_message(msg_buffer);
     receive_first_alive_from_client(current_dvc);
+}
+
+int check_if_all_elems_are_valid(char *elems)
+{
+    char buffer[BUFF_SIZE]; /*El comportament de strtok modifica el string que tokenitza, per tant copio el string en una posició temporal*/
+    char *token;
+    char *delim = ";";
+    int elem_counter = 0;
+    strcpy(buffer, elems);
+    if (strcmp(buffer, "\0") != 0)
+    {
+        token = strtok(buffer, delim);
+        while (token != NULL)
+        {
+            if (!check_if_elem_is_valid(token))
+            {
+                printf("invalid (%s)\n", token);
+                return 0;
+            }
+            elem_counter++;
+            token = strtok(NULL, delim);
+        }
+        printf("oie %d =!=!=!=!\n", elem_counter <= 5);
+        return elem_counter <= 5;
+    }
+    else
+    {
+        printf("NAI\n");
+        return 0;
+    }
+}
+
+int check_if_tcp_port_is_valid(int tcp_port)
+{
+    printf("El port és %d\n", tcp_port);
+    return 1024 <= tcp_port && tcp_port <= 65535;
 }
 
 void receive_first_alive_from_client(DEVICE *current_dvc)
@@ -466,6 +901,7 @@ void send_reg_ack(DEVICE *current_dvc, int udp_sock_fd)
     char rand_num[9];
     int len_addr_cli;
     char data[61];
+    char msg_buffer[BUFF_SIZE];
     socklen_t len_addr_sock;
     UDP_PACKET send_packet;
     struct sockaddr_in sock_addr;
@@ -477,17 +913,14 @@ void send_reg_ack(DEVICE *current_dvc, int udp_sock_fd)
     getsockname(udp_sock_fd, (struct sockaddr *)&sock_addr, &len_addr_sock);
     sprintf(data, "%d", ntohs(sock_addr.sin_port));
     send_packet = create_udp_packet(REG_ACK, rand_num, data);
-    len_addr_cli = sizeof((*current_dvc).cl_addr);
-    bytes_sent = sendto(udp_sock_fd, &send_packet, sizeof(send_packet), 0, (struct sockaddr *)&(*current_dvc).cl_addr, len_addr_cli);
+    len_addr_cli = sizeof((*current_dvc).udp_addr);
+    bytes_sent = sendto(udp_sock_fd, &send_packet, sizeof(send_packet), 0, (struct sockaddr *)&(*current_dvc).udp_addr, len_addr_cli);
+    sprintf(msg_buffer, "Enviat: bytes=%d, comanda=%s, Id.=%s, rndm=%s, dades=%s", bytes_sent, get_packet_type_name(send_packet.p_type), send_packet.id, send_packet.rand_num, send_packet.data);
+    print_debug_message(msg_buffer, args.dflag);
     (*current_dvc).state = WAIT_INFO;
-    if (bytes_sent == PDU_UDP_SIZE)
-    {
-        printf("Contingut del paquet enviat: %d %s %s %s\n", send_packet.p_type, send_packet.id, send_packet.rand_num, send_packet.data);
-    }
-    else
-    {
-        printf("No s'ha enviat tot el paquet");
-    }
+    sprintf(msg_buffer, "Dispositiu amb id \"%s\" passa a estat WAIT_INFO.", (*current_dvc).id);
+    print_info_message(msg_buffer);
+    /*TODO: No crec que s'hagi de fer comprovacio d'enviament complet de dades, solament de la rebuda*/
 }
 
 /*SECTION: PACKETS*/
@@ -500,23 +933,66 @@ UDP_PACKET create_udp_packet(unsigned char p_type, char *rand_num, char *data)
     strcpy(packet.data, data);
     return packet;
 }
-
+/*
 void send_udp_packet(DEVICE *current_dvc, int udp_sock_fd, unsigned char p_type, char *data)
 {
     int bytes_sent;
     int len_addr_cli;
+    char msg_buffer[BUFF_SIZE];
     UDP_PACKET send_packet;
     send_packet = create_udp_packet(p_type, (*current_dvc).rand_num, data);
-    len_addr_cli = sizeof((*current_dvc).cl_addr);
-    bytes_sent = sendto(udp_sock_fd, &send_packet, sizeof(send_packet), 0, (struct sockaddr *)&(*current_dvc).cl_addr, len_addr_cli); /*Mirar que han arribat tots els bytes*/
-    if (bytes_sent == PDU_UDP_SIZE)
+    len_addr_cli = sizeof((*current_dvc).udp_addr);
+    bytes_sent = sendto(udp_sock_fd, &send_packet, sizeof(send_packet), 0, (struct sockaddr *)&(*current_dvc).udp_addr, len_addr_cli); 
+    if (bytes_sent < 0)
     {
-        printf("Contingut del paquet enviat: %d %s %s %s\n", send_packet.p_type, send_packet.id, send_packet.rand_num, send_packet.data);
+        perror("sendto udp");
     }
-    else
+    sprintf(msg_buffer, "Enviat: bytes=%d, comanda=%s, Id.=%s, rndm=%s, dades=%s", bytes_sent, get_packet_type_name(send_packet.p_type), send_packet.id, send_packet.rand_num, send_packet.data);
+    print_debug_message(msg_buffer, args.dflag);
+}*/
+
+void send_udp_packet(char *rand_num, struct sockaddr_in udp_addr, int udp_sock_fd, unsigned char p_type, char *data)
+{
+    int bytes_sent;
+    int len_addr_cli;
+    char msg_buffer[BUFF_SIZE];
+    UDP_PACKET send_packet;
+    send_packet = create_udp_packet(p_type, rand_num, data);
+    len_addr_cli = sizeof(udp_addr);
+    bytes_sent = sendto(udp_sock_fd, &send_packet, sizeof(send_packet), 0, (struct sockaddr *)&udp_addr, len_addr_cli);
+    if (bytes_sent < 0)
     {
-        printf("No s'ha enviat tot el paquet");
+        perror("sendto udp");
     }
+    sprintf(msg_buffer, "Enviat: bytes=%d, comanda=%s, Id.=%s, rndm=%s, dades=%s", bytes_sent, get_packet_type_name(send_packet.p_type), send_packet.id, send_packet.rand_num, send_packet.data);
+    print_debug_message(msg_buffer, args.dflag);
+}
+
+void send_tcp_packet(char *rand_num, int tcp_sock_fd, unsigned char p_type, char *elem, char *value, char *info)
+{
+    int bytes_sent;
+    char msg_buffer[BUFF_SIZE];
+    TCP_PACKET send_packet;
+    send_packet = create_tcp_packet(p_type, rand_num, elem, value, info);
+    bytes_sent = send(tcp_sock_fd, &send_packet, sizeof(send_packet), 0);
+    if (bytes_sent < 0)
+    {
+        perror("send tcp");
+    }
+    sprintf(msg_buffer, "Enviat: bytes=%d, comanda=%s, Id.=%s, rndm=%s, elem=%s, valor=%s, info=%s", bytes_sent, get_packet_type_name(send_packet.p_type), send_packet.id, send_packet.rand_num, send_packet.element, send_packet.value, send_packet.info);
+    print_debug_message(msg_buffer, args.dflag);
+}
+
+TCP_PACKET create_tcp_packet(unsigned char p_type, char *rand_num, char *elem, char *value, char *info)
+{
+    TCP_PACKET packet;
+    packet.p_type = p_type;
+    strcpy(packet.id, cfg.id);
+    strcpy(packet.rand_num, rand_num);
+    strcpy(packet.element, elem);
+    strcpy(packet.value, value);
+    strcpy(packet.info, info);
+    return packet;
 }
 
 /*SECTION: SETTERS*/
@@ -524,12 +1000,14 @@ void send_udp_packet(DEVICE *current_dvc, int udp_sock_fd, unsigned char p_type,
 void disconnect_device(DEVICE *current_dvc)
 {
     char msg_buffer[BUFF_SIZE];
-    (*current_dvc).state = DISCONNECTED;
     memset((*current_dvc).elems, '\0', sizeof((*current_dvc).elems));
     memset((*current_dvc).rand_num, '\0', sizeof((*current_dvc).rand_num));
-    memset(&(*current_dvc).tcp_port, '\0', sizeof((*current_dvc).tcp_port));
-    memset(&(*current_dvc).cl_addr, '\0', sizeof((*current_dvc).cl_addr));
-    sprintf(msg_buffer, "Dispositiu amb id \"%s\" passa a estat DISCONNECTED.", (*current_dvc).id);
+    memset(&(*current_dvc).tcp_addr, '\0', sizeof((*current_dvc).tcp_addr));
+    memset(&(*current_dvc).udp_addr, '\0', sizeof((*current_dvc).udp_addr));
+    memset(&(*current_dvc).alive_counter, '\0', sizeof((*current_dvc).alive_counter));
+    memset(&(*current_dvc).time_last_alive, '\0', sizeof((*current_dvc).time_last_alive));
+    (*current_dvc).state = DISCONNECTED;
+    sprintf(msg_buffer, "Dispositiu amb id \"%s\" passa a estat %s", (*current_dvc).id, get_state_name((*current_dvc).state));
     print_info_message(msg_buffer);
 }
 
@@ -670,7 +1148,7 @@ int is_random_number_and_data_valid(UDP_PACKET *recv_packet, char *expected_rand
 
 int is_address_and_port_valid(DEVICE *current_dvc, struct sockaddr_in addr_cli)
 {
-    return (*current_dvc).cl_addr.sin_addr.s_addr == addr_cli.sin_addr.s_addr && (*current_dvc).cl_addr.sin_port == addr_cli.sin_port;
+    return (*current_dvc).udp_addr.sin_addr.s_addr == addr_cli.sin_addr.s_addr && (*current_dvc).udp_addr.sin_port == addr_cli.sin_port;
 }
 
 /*SECTION: PARSING*/
@@ -686,7 +1164,7 @@ CFG_PARAMS get_parsed_configuration_file_params(PARSED_ARGS args)
     file_pointer = fopen(args.cfgname, "r");
     if (file_pointer == NULL)
     {
-        printf("adeu, hi ha un error\n");
+        perror("open config. file");
         exit(EXIT_FAILURE);
     }
     while (fgets(buffer, BUFF_SIZE, file_pointer))
@@ -735,10 +1213,8 @@ PARSED_ARGS get_parsed_arguments(int argc, char **argv)
         else if (c == 'u')
         {
             strcpy(args.bbddname, optarg);
-        } /*
-                IMPORTANT
-                potser fan falta uns breaks aqui, q els vaig borrar per aveure que passave pero demoment va be
-            */
+        }
+        /*TODO:potser fan falta uns breaks aqui, q els vaig borrar per aveure que passave pero demoment va be*/
     }
     return args;
 }
@@ -746,25 +1222,44 @@ PARSED_ARGS get_parsed_arguments(int argc, char **argv)
 DATA_REG_INFO parse_data_of_reg_info_packet(char *data)
 {
     DATA_REG_INFO parsed_data;
-    char tcp_port_str[17];
-    int i;
-    int j;
-    memset(&parsed_data.tcp_port, 0, sizeof(parsed_data.tcp_port));
-    memset(&parsed_data.elems, 0, sizeof(parsed_data.tcp_port));
-    i = 0;
-    while (data[i] != ',')
-    { /*TODO: S'han de pensar casos especials. I si no està ben format i si no se q blablabla*/
-        i += 1;
-    }
-    strncpy(tcp_port_str, data, i);
-    j = i + 1;
-    parsed_data.tcp_port = atoi(tcp_port_str);
-    while (data[j] != '\0')
+    char buffer[BUFF_SIZE];
+    char *token;
+    char *delim = ",";
+    int i = 0;
+    int tcp_is_num = 1;
+    strcpy(buffer, data);
+    token = strtok(buffer, delim);
+    if (token != NULL)
     {
-        j += 1;
+        printf(">>>>%s<<<<<\n", token);
+        while (token[i] != '\0')
+        {
+            if (!isdigit(token[i]))
+            {
+                tcp_is_num = 0;
+                break;
+            }
+            i++;
+        }
+        if (tcp_is_num && 0 < i)
+        {
+            parsed_data.tcp_port = atoi(token);
+        }
+        else
+        {
+            parsed_data.tcp_port = 0;
+        }
+        token = strtok(NULL, delim);
+        printf(">>>>%s<<<<<\n", token);
+        strcpy(parsed_data.elems, token);
+        return parsed_data;
     }
-    strncpy(parsed_data.elems, data + i + 1, j - i); /*TODO: Massa lio, polir aixo*/
-    return parsed_data;
+    else
+    {
+        parsed_data.tcp_port = 0;
+        strcpy(parsed_data.elems, "");
+        return parsed_data;
+    }
 }
 
 /*SECTION: MISC*/
@@ -775,8 +1270,22 @@ void print_all_devices(NODE *head)
     printf("-----Id.---- --RNDM-- ------ IP ----- ----ESTAT--- --ELEMENTS-------------------------------------------\n");
     while ((*node).dvc != NULL)
     {
-        inet_ntop(AF_INET, &((*(*node).dvc).cl_addr.sin_addr), buffer, INET_ADDRSTRLEN);
+        inet_ntop(AF_INET, &((*(*node).dvc).udp_addr.sin_addr), buffer, INET_ADDRSTRLEN);
         printf("%s\t-\t%s-\t%s-\t%s-\t%s\n", (*(*node).dvc).id, (*(*node).dvc).rand_num, buffer, get_state_name((*(*node).dvc).state), (*(*node).dvc).elems);
         node = node->next;
     }
+}
+
+void print_recvd_udp_packet(UDP_PACKET *recv_packet)
+{
+    char msg_buffer[BUFF_SIZE];
+    sprintf(msg_buffer, "Rebut: bytes=%ld, comanda=%s, Id.=%s, rndm=%s, dades=%s", sizeof(UDP_PACKET), get_packet_type_name((*recv_packet).p_type), (*recv_packet).id, (*recv_packet).rand_num, (*recv_packet).data);
+    print_debug_message(msg_buffer, args.dflag);
+}
+
+void print_recvd_tcp_packet(TCP_PACKET *recv_packet)
+{
+    char msg_buffer[BUFF_SIZE];
+    sprintf(msg_buffer, "Rebut: bytes=%ld, comanda=%s, Id.=%s, rndm=%s, elem=%s, valor=%s, info=%s", sizeof(UDP_PACKET), get_packet_type_name((*recv_packet).p_type), (*recv_packet).id, (*recv_packet).rand_num, (*recv_packet).element, (*recv_packet).value, (*recv_packet).info);
+    print_debug_message(msg_buffer, args.dflag);
 }

@@ -48,7 +48,7 @@
 #define REGISTERED 0xa5
 #define SEND_ALIVE 0xa6
 
-#define LISTEN_THRESHOLD 4
+#define LISTEN_THRESHOLD 42
 
 #define PDU_UDP_SIZE 84
 #define PDU_TCP_SIZE 127
@@ -60,8 +60,10 @@
 #define TIME_WAITING_FOR_REGISTER 1  /*r*/
 #define TIMES_TO_WAIT_FOR_REG_INFO 2 /*s*/
 
-#define TIME_FIRST_ALIVE 3
-#define MAX_ALIVE_COUNTER 3
+#define TIME_FIRST_ALIVE 3    /*w*/
+#define MAX_ALIVE_COUNTER 3   /*x*/
+#define TIME_BETWEEN_ALIVES 2 /*v*/
+
 char *CFG_FILE_DEFAULT_NAME = "server.cfg";
 char *BBDD_DEV_DEFAULT_NAME = "bbdd_dev.dat";
 
@@ -84,11 +86,12 @@ typedef struct DEVICE
     int shm_id;        /*INIT*/
     int state;         /*INIT */
     int alive_counter; /*INIT*/
-    int tcp_port;
     char rand_num[9];
     char id[13]; /*INIT*/
     char elems[41];
-    struct sockaddr_in cl_addr;
+    time_t time_last_alive;
+    struct sockaddr_in udp_addr;
+    struct sockaddr_in tcp_addr;
 } DEVICE;
 
 typedef struct NODE
@@ -111,6 +114,16 @@ typedef struct DATA_REG_INFO
     char elems[41];
 } DATA_REG_INFO;
 
+typedef struct TCP_PACKET
+{
+    unsigned char p_type;
+    char id[13];
+    char rand_num[9];
+    char element[8];
+    char value[16];
+    char info[80];
+
+} TCP_PACKET;
 int setup_udp_socket(int udp_port)
 {
     struct sockaddr_in address;
@@ -135,7 +148,7 @@ int setup_udp_socket(int udp_port)
 /**
  * Aixó es pot ajuntar i ya
  **/
-int setup_tcp_socket(int tcp_port)
+int setup_tcp_socket(int tcp_port, int listen_flag)
 {
     struct sockaddr_in address;
     int tcp_sock_fd;
@@ -154,10 +167,14 @@ int setup_tcp_socket(int tcp_port)
         perror("bind tcp socket");
         exit(EXIT_FAILURE);
     }
-    if (listen(tcp_sock_fd, LISTEN_THRESHOLD) < 0)
+    if (listen_flag)
     {
-        perror("listen tcp socket");
-        exit(EXIT_FAILURE);
+
+        if (listen(tcp_sock_fd, LISTEN_THRESHOLD) < 0)
+        {
+            perror("listen tcp socket");
+            exit(EXIT_FAILURE);
+        }
     }
     return tcp_sock_fd;
 }
@@ -265,6 +282,30 @@ char *get_packet_type_name(unsigned char p_type)
     {
         return "ALIVE_REJ";
     }
+    else if (p_type == SEND_DATA)
+    {
+        return "SEND_DATA";
+    }
+    else if (p_type == SET_DATA)
+    {
+        return "SET_DATA";
+    }
+    else if (p_type == GET_DATA)
+    {
+        return "GET_DATA";
+    }
+    else if (p_type == DATA_ACK)
+    {
+        return "DATA_ACK";
+    }
+    else if (p_type == DATA_NACK)
+    {
+        return "DATA_NACK";
+    }
+    else if (p_type == DATA_REJ)
+    {
+        return "DATA_REJ";
+    }
     else
     {
         return "UNKOWN_PACKET_TYPE";
@@ -300,7 +341,80 @@ void print_info_message(char *msg)
     print_message("INFO", msg);
 }
 
+int is_str_alphanumeric(char *str)
+{
+    int i = 0;
+    while (str[i] != '\0')
+    {
+        if (!isalpha(str[i]))
+        {
+            return 0;
+        }
+        i++;
+    }
+    return 1;
+}
+
+int check_if_elem_is_valid(char *elem)
+{
+    int i;
+    for (i = 0; i < 3; i++)
+    {
+        if (!(isalpha(elem[i]) && isupper(elem[i])))
+        {
+            printf("-------%c\n", elem[i]);
+            return 0;
+        }
+    }
+    if (elem[i] != '-')
+    {
+        printf("-------%c\n", elem[i]);
+        return 0;
+    }
+    i++;
+    if (!isdigit(elem[i]))
+    {
+        printf("-------%c\n", elem[i]);
+        return 0;
+    }
+    i++;
+    if (elem[i] != '-')
+    {
+        printf("-------%c\n", elem[i]);
+        return 0;
+    }
+    i++;
+    if (elem[i] != 'I' && elem[i] != 'O')
+    {
+        printf("-------%c\n", elem[i]);
+        return 0;
+    }
+    return 1;
+}
+
+int check_if_device_has_elem(char *dvc_elem, char *elem)
+{
+    char buffer[BUFF_SIZE];
+    char *token;
+    char *delim = ";";
+    printf("%s\n", dvc_elem);
+    strcpy(buffer, dvc_elem);
+    token = strtok(buffer, delim);
+    while (token != NULL)
+    {
+        printf("\n[%s]----[%s]\n", token, elem);
+        if (strcmp(token, elem) == 0)
+        {
+            return 1;
+        }
+        token = strtok(NULL, delim);
+    }
+    return 0;
+}
 /*
+
+
+
     if(fork() == 0){
         tmp = head;
         while((*tmp).next != NULL){
@@ -317,6 +431,187 @@ void print_info_message(char *msg)
     }
 
 
+int check_if_reg_info_data_is_valid(UDP_PACKET *recv_packet)
+{
+    int i = 0;
+    char *data = (*recv_packet).data;
 
+    while ('0' <= data[i] && data[i] <= '9' && data[i] != ',')
+    {
+        i++;
+    }
+    if (data[i] != ',')
+    {
+        return 0;
+    }
+    i++;
+    while (data[i] != '\0')
+    {
 
-*/
+        if (!check_if_elem_is_valid(data + i))
+        {
+            return 0;
+        }
+        i += 7;
+        if (data[i] == ';')
+        {
+            i++;
+        }
+        else
+        {
+            break;
+        }
+    }
+    return data[i] == '\0';
+}
+
+int check_if_device_has_elem(char *dvc_elem, char *elem)
+{
+    int i;
+    int are_equal;
+    if (check_if_elem_is_valid(elem))
+    {
+        i = 0;
+        while (dvc_elem[i] != '\0')
+        {
+            are_equal = 1;
+            while (are_equal && !(dvc_elem[i] == ';' || dvc_elem[i] == '\0'))
+            {
+                if (dvc_elem[i] != elem[i % 8])
+                {
+                    are_equal = 0;
+                }
+                i++;
+            }
+            if (are_equal)
+            {
+                return 1;
+            }
+            i++;
+        }
+        return 0;
+    }
+    else
+    {
+        return 0;
+    }
+}
+
+int check_if_input_is_set(char *input)
+{
+    DEVICE *current_dvc;
+    char *token;
+    char *delim = " ";
+    token = strtok(input, delim);
+    if (strcmp(token, "set") == 0)
+    {
+        token = strtok(NULL, delim);
+        current_dvc = get_device_from_id(token);
+        if (current_dvc != NULL)
+        {
+            return 1;
+        }
+        else
+        {
+            return 0;
+        }
+    }
+    else
+    {
+        return 0;
+    }
+}
+
+void exec_set_cmd(char *token)
+{
+    DEVICE *current_dvc;
+    TCP_PACKET packet_to_send;
+    int new_tcp_sock;
+    int e_code;
+    int bytes_sent;
+    char msg_buffer[BUFF_SIZE];
+    char *elem;
+    char *value;
+    char *delim = " ";
+
+    token = strtok(NULL, delim);
+    current_dvc = get_device_from_id(token);
+    if (current_dvc != NULL)
+    {
+        if ((*current_dvc).state == SEND_ALIVE)
+        {
+            token = strtok(NULL, delim);
+            elem = token;
+            if (check_if_device_has_elem((*current_dvc).elems, elem))
+            {
+                token = strtok(NULL, delim);
+                value = token;
+                if (is_str_alphanumeric(value) && sizeof(value) <= 15)
+                {
+                    new_tcp_sock = setup_tcp_socket(0);
+                    e_code = connect(new_tcp_sock, (struct sockaddr *)&(*current_dvc).cl_addr, sizeof(struct sockaddr_in));
+                    if (e_code < 0)
+                    {
+                        sprintf(msg_buffer, "No s'ha pogut conectar al socket tcp del dispositiu.");
+                        print_debug_message(msg_buffer, args.dflag);
+                        disconnect_device(current_dvc);
+                    }
+                    else
+                    {
+                        packet_to_send = create_tcp_packet(SET_DATA, (*current_dvc).rand_num, elem, value, (*current_dvc).id);
+                        bytes_sent = send(new_tcp_sock, &packet_to_send, sizeof(packet_to_send), 0);
+                        if (bytes_sent < 0)
+                        {
+                            perror("send tcp");
+                            exit(1);
+                        }
+                    }
+                    close(new_tcp_sock);
+                }
+                else
+                {
+                    sprintf(msg_buffer, "Comanda incorrecta: El valor no té el format adeqüat.");
+                    print_debug_message(msg_buffer, args.dflag);
+                }
+            }
+            else
+            {
+                sprintf(msg_buffer, "Comanda incorrecta: Dispositiu no té l'element.");
+                print_debug_message(msg_buffer, args.dflag);
+            }
+        }
+        else
+        {
+            sprintf(msg_buffer, "Comanda incorrecta: Dispositiu no està amb estat SEND_ALIVE.");
+            print_debug_message(msg_buffer, args.dflag);
+        }
+    }
+    else
+    {
+        sprintf(msg_buffer, "Comanda incorrecta: Dispositiu no està registrat.");
+        print_debug_message(msg_buffer, args.dflag);
+    }
+}
+
+DATA_REG_INFO parse_data_of_reg_info_packet(char *data)
+{
+    DATA_REG_INFO parsed_data;
+    char tcp_port_str[17];
+    int i;
+    int j;
+    memset(&parsed_data.tcp_port, 0, sizeof(parsed_data.tcp_port));
+    memset(&parsed_data.elems, 0, sizeof(parsed_data.elems));
+    i = 0;
+    while (data[i] != ',')
+        i += 1;
+    }
+    strncpy(tcp_port_str, data, i);
+    j = i + 1;
+    parsed_data.tcp_port = atoi(tcp_port_str);
+    while (data[j] != '\0')
+    {
+        j += 1;
+    }
+    strncpy(parsed_data.elems, data + i + 1, j - i); 
+    return parsed_data;
+}*/
