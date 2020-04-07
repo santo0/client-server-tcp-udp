@@ -64,6 +64,8 @@
 #define MAX_ALIVE_COUNTER 3   /*x*/
 #define TIME_BETWEEN_ALIVES 2 /*v*/
 
+#define TIME_WAIT_RECV_TCP 3  /*m*/
+
 char *CFG_FILE_DEFAULT_NAME = "server.cfg";
 char *BBDD_DEV_DEFAULT_NAME = "bbdd_dev.dat";
 
@@ -362,31 +364,26 @@ int check_if_elem_is_valid(char *elem)
     {
         if (!(isalpha(elem[i]) && isupper(elem[i])))
         {
-            printf("-------%c\n", elem[i]);
             return 0;
         }
     }
     if (elem[i] != '-')
     {
-        printf("-------%c\n", elem[i]);
         return 0;
     }
     i++;
     if (!isdigit(elem[i]))
     {
-        printf("-------%c\n", elem[i]);
         return 0;
     }
     i++;
     if (elem[i] != '-')
     {
-        printf("-------%c\n", elem[i]);
         return 0;
     }
     i++;
     if (elem[i] != 'I' && elem[i] != 'O')
     {
-        printf("-------%c\n", elem[i]);
         return 0;
     }
     return 1;

@@ -15,11 +15,7 @@ from auxiliar_functions import *
 #TODO: Llista per guardar els sockets i en cas de tacar el programar passar una funcio que tanqui tots els sockets estos i ya
 UDP_Packet = namedtuple('UDP_Packet', 't_pack id rand_num data')
 TCP_Packet = namedtuple('TCP_Packet', 't_pack id rand_num elem value info')
-#Canviar els noms dels fields, no m'acaben de convenser el local_tcp, sever,...
-#ClientInfo = namedtuple('ClientInfo', 'id elements local_tcp server server_udp')
-#Provare de ferho amb diccionaris, que ara per ara serà més senzill
-#Fentho amb un diccionari em permetra afegir el camp de tcp del server més endavant
-#Aquest metode depen molt del nom dels parametres del fitxer
+
 cfg_file_info = {
     'Id':None, 
     'Params':{},
@@ -36,11 +32,24 @@ reg_process_info = {
     'timeout' : time_between_packets,
     'counter' : 1,
     'num_reg_proc' : 1}
-#Pendent a revisió el format d'aquestes variables
 cl_state = DISCONNECTED
 consecutive_non_received_alives = 0
+active_sockets = []
+active_threads = []
 
-#TODO: Separar per elements i tal
+
+"""
+IMPORTANT:
+    -El arxiu de configuració ha d'estar amb el format següent:
+        Id = [id]
+        Params = [elem;elem;...]
+        Local-TCP = [num port tcp client]
+        Server = [nom o adreça ip server]
+        Server-UDP = [num port udp server]
+    -No es fa una comprovació de la correctesa d'aquests parametres
+    -Que els parametres siguin vàlids és essencial pel funcionament del client
+"""
+
 def get_client_data_from_file(file_name):
     with open(file_name) as f:
         line = f.readline()
@@ -62,6 +71,7 @@ def parse_params(params_to_parse):
 
 def create_udp_socket():
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)      #En cas de TIME_WAIT
     udp_sock.bind(('', 0))
     logging.debug('S\'ha obert el port udp')
     return udp_sock
@@ -69,6 +79,7 @@ def create_udp_socket():
 def create_tcp_socket(tcp_port):
     global cfg_file_info
     tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)      #En cas de TIME_WAIT
     tcp_sock.bind(('', tcp_port))
     logging.debug('S\'ha obert el port tcp')
     return tcp_sock
@@ -81,9 +92,12 @@ def get_relevant_sequence_of_bytes(bytes_to_slash):
 
 def start_registration_process():
     global cl_state
+    global consecutive_non_received_alives
+    global reg_process_info
     reg_process_info['counter'] = 1
     reg_process_info['timeout'] = time_between_packets
     reg_process_info['num_reg_proc'] += 1
+    consecutive_non_received_alives = 0
     logging.info('Canvi d\'estat de {} a NOT_REGISTERED'.format(get_name_of_state(cl_state)))
     cl_state = NOT_REGISTERED
 
@@ -91,8 +105,10 @@ def send_packet_udp(udp_sock, udp_address, packet, packet_content, new_state=Non
     global cl_state
     bytes_sent = udp_sock.sendto(packet, udp_address)
     logging.debug('Enviat: bytes={}, tipus={}, id={}, rndom={}, dades={}'.format(bytes_sent, 
-                                                                                 get_name_of_packet_type(packet_content[0]), 
-                                                                                 *packet_content))
+                                                                                 get_name_of_packet_type(packet_content.t_pack), 
+                                                                                 packet_content.id,
+                                                                                 packet_content.rand_num,
+                                                                                 packet_content.data))
     if new_state:
         cl_state = new_state
         logging.info('Dispositiu passa a l\'estat {}'.format(get_name_of_state(new_state)))
@@ -110,7 +126,7 @@ def receive_packet_udp(ready_to_read):
 
 def send_reg_req_packet_until_servers_response(udp_sock):
     global cl_state, rcv_reg_info, reg_process_info
-    packet_content = (REG_REQ, (cfg_file_info['Id']+'\0').encode('ascii'), '00000000\0'.encode('ascii'), '\0'.encode('ascii'))
+    packet_content = UDP_Packet(REG_REQ, (cfg_file_info['Id']+'\0').encode('ascii'), '00000000\0'.encode('ascii'), '\0'.encode('ascii'))
     packet = struct.pack(UDP_PACKET_FORMAT, *packet_content)
     udp_address = (cfg_file_info['Server'], int(cfg_file_info['Server-UDP']))
     reg_ack_recvd = False
@@ -198,11 +214,11 @@ def complete_registration(udp_sock):
             elif recv_packet.t_pack == REG_REJ:
                 start_registration_process()
             else:
-                logging.info('Rebut paquet no permés ({}), passant a estat NOT_REGISTERED'.format(recv_packet.t_pack))
+                logging.info('Paquet rebut no permés ({}), passant a estat NOT_REGISTERED'.format(recv_packet.t_pack))
                 start_registration_process()       
         else:
-            start_registration_process()
             logging.info('Dades d\'identificació incorrectes, passant a estat NOT_REGISTERED')
+            start_registration_process()
 
 #Quite unsafe function
 def registration_phase(udp_sock):
@@ -252,12 +268,7 @@ def receive_alive_packet(udp_sock):
     global cfg_file_info
     global consecutive_non_received_alives
     ready_to_read, ready_to_write, in_error = select.select([udp_sock], [], [], 0)
-    if len(ready_to_read) == 0:
-        consecutive_non_received_alives += 1
-        logging.debug('ALIVE %d no rebut', consecutive_non_received_alives)
-        if consecutive_non_received_alives == max_consecutive_non_rcv_alv:
-            start_registration_process()
-    else:
+    if 0 < len(ready_to_read):
         recv_bytes = ready_to_read[0].recvfrom(84)      #TODO: Arreglar esto, aqui hay un problema            
         recv_packet = UDP_Packet(*struct.unpack(UDP_PACKET_FORMAT,recv_bytes[0]))
         logging.debug('Rebut: bytes={}, tipus={}, id={}, rndom={}, dades={}'.format(len(recv_bytes[0]), 
@@ -272,6 +283,11 @@ def receive_alive_packet(udp_sock):
                 start_registration_process()
         else:
             logging.info('Dades d\'identificació incorrectes, passant a estat NOT_REGISTERED')
+            start_registration_process()        
+    else:
+        consecutive_non_received_alives += 1
+        logging.debug('ALIVE %d no rebut', consecutive_non_received_alives)
+        if max_consecutive_non_rcv_alv <= consecutive_non_received_alives:
             start_registration_process()
 
 ##
@@ -312,11 +328,9 @@ def set_param_value(param, new_value):
     param_dict[param] = new_value
     logging.debug('El element {} ha canviat de valor ({})'.format(param, new_value))
 
-
 def receive_packet_tcp(tcp_sock):
     recv_bytes = tcp_sock.recv(CMD_PACKET_SIZE)
     recv_packet = TCP_Packet(*(get_relevant_sequence_of_bytes(elem) if type(elem) == bytes else elem for elem in struct.unpack(TCP_PACKET_FORMAT,recv_bytes)))
-    print(recv_packet)
     logging.debug('Rebut: bytes={}, tipus={}, id={}, rndom={}, elem={}, value={}, info={}'.format(len(recv_bytes), 
                                                                                                     get_name_of_packet_type(recv_packet.t_pack), 
                                                                                                     recv_packet.id, 
@@ -334,10 +348,14 @@ def send_packet_tcp(tcp_sock, packet_type, elem, value, info):
                                 value,
                                 info)
     bytes_to_send = struct.pack(TCP_PACKET_FORMAT, *packet_content)
-    tcp_sock.send(bytes_to_send)
-    logging.debug('Enviat: bytes={}, tipus={}, id={}, rndom={}, dades={}'.format(len(bytes_to_send),
-                                                                                get_name_of_packet_type(packet_content.t_pack),
-                                                                                *packet_content))
+    send_bytes = tcp_sock.send(bytes_to_send)
+    logging.debug('Enviat: bytes={}, tipus={}, id={}, rndom={}, elem={}, value={}, info={}'.format(send_bytes, 
+                                                                                                    get_name_of_packet_type(packet_type), 
+                                                                                                    cfg_file_info['Id'], 
+                                                                                                    rcv_reg_info['Random_number'], 
+                                                                                                    elem,
+                                                                                                    value,
+                                                                                                    info))
 
 def send_param(param):
     global cfg_file_info
@@ -356,16 +374,25 @@ def send_param(param):
             if check_valid_identity(recv_packet):
                 #TODO: Falte comprovacios de tipus de paquet i algo mes segurament
                 if recv_packet.t_pack == DATA_ACK:
-                    if not (get_relevant_sequence_of_bytes(recv_packet.elem) == param.encode('ascii') and
+                    if (get_relevant_sequence_of_bytes(recv_packet.elem) == param.encode('ascii') and
                         get_relevant_sequence_of_bytes(recv_packet.value) == value.encode('ascii')):
-                        logging.debug('Elements incorrectes, no es faràn més accions al respecte')
+                        if get_relevant_sequence_of_bytes(recv_packet.info) == cfg_file_info['Id'].encode('ascii'):
+                            logging.debug('Dades emmagatzemades correctament en el servidor.')
+                        else:
+                            logging.debug('Info. incorrecta. Id del dispositiu incorrecta.')
+                            start_registration_process()
+                    else:
+                        logging.debug('Element incorrecte, no es faràn més accions al respecte')
                 elif recv_packet.t_pack == DATA_NACK:
-                    logging.debug('Missatge no acceptat, no es faràn més accions al respecte')
+                    logging.debug('Paquet no acceptat, no es faràn més accions al respecte. Motiu: {motiu}'.format(motiu = (recv_packet.info)))
                 elif recv_packet.t_pack == DATA_REJ:
+                    logging.debug('Paquet rebutjat. Motiu: {motiu}'.format(motiu = (recv_packet.info)))
                     start_registration_process()
                 else:
+                    logging.debug('Tipus de paquet no permés. Tipus de paquet: {paq}'.format(paq = get_name_of_packet_type(recv_packet.t_pack)))
                     start_registration_process()
             else:
+                logging.debug('Dades d\'identificació incorrectes: id: {id}, num_rand: {n_rand}'.format(id = (recv_packet.id), n_rand = (recv_packet).rand_num))
                 start_registration_process()
         else:
             logging.debug('Missatge no rebut, no es faràn més accions al respecte')
@@ -373,14 +400,12 @@ def send_param(param):
         logging.debug('S\'ha tancat el port tcp')
     else:
         logging.debug('El element {} no està registrat en el dispositiu.'.format(param))
+    tcp_sock.close()
 
 
 def run_command_line():
     global cl_state
     global cfg_file_info
-    #TODO: Pensar una alternativa per aixó
-    while cl_state == REGISTERED:
-        pass
     while cl_state == SEND_ALIVE:
         ready_to_read, ready_to_write, in_error = select.select([sys.stdin],[],[], 0)
         if len(ready_to_read) != 0:
@@ -406,77 +431,101 @@ def is_elem_in_device(elem):
     global cfg_file_info
     return elem.decode('ascii') in cfg_file_info['Params'].keys()
 
-
-
-def answer_srv_cmd(cmd_sock, recv_packet):
-    global rcv_reg_info
-    packet_content = TCP_Packet(DATA_ACK, (cfg_file_info['Id']+'\0').encode('ascii'), 
-                                                                rcv_reg_info['Random_number'], 
-                                                                recv_packet.elem, 
-                                                                recv_packet.value,
-                                                                'Valor establert correctament'.encode('ascii'))
-    bytes_to_send = struct.pack(TCP_PACKET_FORMAT, *packet_content)
-    cmd_sock.send(bytes_to_send)
-    logging.debug('Enviat: bytes={}, tipus={}, id={}, rndom={}, dades={}'.format(len(bytes_to_send),
-                                                                                get_name_of_packet_type(packet_content.t_pack),
-                                                                                *packet_content))
-
-
-def receive_commands_from_server(tcp_sock):
+def handle_tcp_server_command(cmd_sock, srv_addr):
     global cfg_file_info
     global rcv_reg_info
-    while cl_state == SEND_ALIVE:
-        cmd_sock, srv_addr = tcp_sock.accept()
-        #comprovar adress
-        if socket.gethostbyname(srv_addr[0]) == cfg_file_info['Server']:
+    global cl_state
+    if socket.gethostbyname(srv_addr[0]) == cfg_file_info['Server']:
+        ready_to_read, ready_to_write, in_error = select.select([cmd_sock],[],[], waiting_time_send_response)
+        if 0 < len(ready_to_read):
             recv_packet = receive_packet_tcp(cmd_sock)
-            if check_valid_identity(recv_packet):              #Repeteixes comprovació obvia (LA IP JA LA MIRES ADALT)
+            if check_valid_identity(recv_packet):              
                 if is_elem_in_device(recv_packet.elem):
-                    if recv_packet.t_pack == SET_DATA:
-                        if recv_packet.elem.decode('ascii')[-1] == 'I': 
-                            set_param_value(recv_packet.elem.decode('ascii'), 
-                                            recv_packet.value.decode('ascii'))
+                    if get_relevant_sequence_of_bytes(recv_packet.info) == cfg_file_info['Id'].encode('ascii'):#SECTION:
+                        if recv_packet.t_pack == SET_DATA:
+                            if recv_packet.elem.decode('ascii')[-1] == 'I': 
+                                set_param_value(recv_packet.elem.decode('ascii'), 
+                                                recv_packet.value.decode('ascii'))
+                                send_packet_tcp(cmd_sock, 
+                                                DATA_ACK, 
+                                                recv_packet.elem, 
+                                                recv_packet.value, 
+                                                (cfg_file_info['Id']+'\0').encode('ascii'))
+                            else:
+                                logging.info('El element no és d\'entrada.')
+                                send_packet_tcp(cmd_sock, 
+                                                DATA_NACK, 
+                                                recv_packet.elem, 
+                                                recv_packet.value, 
+                                                'El element no es d\'entrada.\0'.encode('ascii'))                    
+                        elif recv_packet.t_pack == GET_DATA:
+                            value = cfg_file_info['Params'][recv_packet.elem.decode('ascii')]
                             send_packet_tcp(cmd_sock, 
                                             DATA_ACK, 
                                             recv_packet.elem, 
-                                            recv_packet.value, 
+                                            value.encode('ascii'), 
                                             (cfg_file_info['Id']+'\0').encode('ascii'))
                         else:
-                            logging.info('El element no és d\'entrada')
+                            logging.debug('Tipus de paquet no esperat.')
                             send_packet_tcp(cmd_sock, 
-                                            DATA_NACK, 
+                                            DATA_REJ, 
                                             recv_packet.elem, 
                                             recv_packet.value, 
-                                            'El element no es d\'entrada\0'.encode('ascii'))                    
-                    elif recv_packet.t_pack == GET_DATA:
-                        value = cfg_file_info['Params'][recv_packet.elem.decode('ascii')]
-                        send_packet_tcp(cmd_sock, 
-                                        DATA_ACK, 
-                                        recv_packet.elem, 
-                                        value.encode('ascii'), 
-                                        (cfg_file_info['Id']+'\0').encode('ascii'))
+                                            'S\'esperava paquet SET_DATA o DATA_NACK.\0'.encode('ascii'))
+                            start_registration_process()
+                    else:
+                        logging.debug('Info. incorrecta. Id del dispositiu incorrecta.')
+                        start_registration_process()
                 else:
+                    logging.debug('El element no està registrat en el dispositiu.')
                     send_packet_tcp(cmd_sock, 
                                     DATA_NACK, 
                                     recv_packet.elem, 
                                     recv_packet.value, 
                                     'El element no este registrat en el dispositiu\0'.encode('ascii'))
-                    logging.info('El element no està registrat en el dispositiu')
             else:
                 send_packet_tcp(cmd_sock, 
                                     DATA_REJ, 
                                     recv_packet.elem, 
                                     recv_packet.value, 
-                                    'Dades d\'identificació incorrectes\0'.encode('ascii'))
+                                    'Dades d\'identificacio incorrectes.\0'.encode('ascii'))
                 logging.info('Dades d\'identificació incorrectes')
                 start_registration_process()
         else:
-            logging.info('INTRUSO INTRUSO UEUEUEUEUEUEUEU')
-            start_registration_process()
-        cmd_sock.close()
+            logging.debug('El servidor no ha enviat res, tancant comunicació per TCP.')
+    else:
+        logging.debug('Adreça incorrecta.')
+        start_registration_process()
+    cmd_sock.close()
+
+
+
+def receive_commands_from_server(tcp_sock):
+    global cfg_file_info
+    global rcv_reg_info
+    global cl_state
+    while cl_state == SEND_ALIVE:
+        ready_to_read, ready_to_write, in_error = select.select([tcp_sock],[],[], 0)
+        if 0 < len(ready_to_read):
+            cmd_sock, srv_addr = tcp_sock.accept()
+            handle_srv_cmd = threading.Thread(target=handle_tcp_server_command, args=(cmd_sock, srv_addr))
+            handle_srv_cmd.setDaemon(True)
+            handle_srv_cmd.start()
+
+            
 
 ##get GHX0E32LWQ6C LUM-0-I
 ##set GHX0E32LWQ6C LUM-0-I papoepo
+def send_and_recv_first_alive(udp_sock):
+    global cl_state
+    receive_first_alive_th = threading.Timer(interval=time_between_alive_packets*send_alive_trys,function=receive_first_alive_packet, args=(udp_sock, ))
+    receive_first_alive_th.setDaemon(True)
+    send_alive_packet(udp_sock)                     #El primer alive
+    receive_first_alive_th.start()
+    receive_first_alive_th.join()
+    while receive_first_alive_th.is_alive():        #Aquesta comprovacio no farie falta perq mai canviaria d'estat aqui, a no se q fagi ctrl + c
+        if cl_state != SEND_ALIVE:
+            receive_first_alive_th.cancel()
 
 
 def main():
@@ -484,24 +533,23 @@ def main():
     global cfg_file_info
     global rcv_reg_info
     global reg_process_info
+    global active_sockets
+    global active_threads
     while True: 
         udp_sock = create_udp_socket()
+        active_sockets.append(udp_sock)
         registration_phase(udp_sock)
-        receive_first_alive_th = threading.Timer(interval=time_between_alive_packets*send_alive_trys,function=receive_first_alive_packet, args=(udp_sock, ))
-        receive_first_alive_th.setDaemon(True)
-        send_cmd_th = threading.Thread(target=run_command_line)
-        send_cmd_th.setDaemon(True)
-        send_alive_packet(udp_sock)
-        receive_first_alive_th.start()
-        receive_first_alive_th.join()
-        while receive_first_alive_th.is_alive():        #Aquesta comprovacio no farie falta perq mai canviaria d'estat aqui, a no se q fagi ctrl + c
-            if cl_state != SEND_ALIVE:
-                receive_first_alive_th.cancel()
+        send_and_recv_first_alive(udp_sock)
         if cl_state == SEND_ALIVE:
             tcp_sock = create_tcp_socket(int(cfg_file_info['Local-TCP']))
-            tcp_sock.listen()
+            tcp_sock.listen(42)
+            active_sockets.append(tcp_sock)
+            send_cmd_th = threading.Thread(target=run_command_line)
+            send_cmd_th.setDaemon(True)
+            active_threads.append(send_cmd_th)
             receive_cmd_th = threading.Thread(target=receive_commands_from_server, args=(tcp_sock, ))
             receive_cmd_th.setDaemon(True)
+            active_threads.append(receive_cmd_th)
             send_cmd_th.start()
             receive_cmd_th.start()
             while cl_state == SEND_ALIVE:
@@ -512,15 +560,25 @@ def main():
                 while receive_alive_th.is_alive():
                     if cl_state != SEND_ALIVE:
                         receive_alive_th.cancel()
+                receive_alive_th.join() 
         if cl_state == DISCONNECTED:
-            udp_sock.close()
-            tcp_sock.close()
+            close_all_active_sockets()
             sys.exit(1)
-        send_cmd_th.join()
-        receive_cmd_th.join()
-        receive_alive_th.join()
-        udp_sock.close()
-        tcp_sock.close()
+        join_all_active_threads()
+        close_all_active_sockets()
+
+def join_all_active_threads():
+    global active_threads
+    while 0 < len(active_threads):
+        thread = active_threads.pop()
+        thread.join()
+
+
+def close_all_active_sockets():
+    global active_sockets
+    while 0 < len(active_sockets):
+        sock = active_sockets.pop()
+        sock.close()
 
 if __name__ == '__main__':
     try:
@@ -532,11 +590,11 @@ if __name__ == '__main__':
         if not os.path.exists(file_path):
             file_path = def_conf_file
         if args.d:
-            logging.basicConfig(format='%(asctime)s: DEBUG.\t==> %(message)s',
+            logging.basicConfig(format='%(asctime)s: DEBUG. ==> %(message)s',
                                 level=logging.DEBUG,
-                                datefmt='%H:%M:%S:')
+                                datefmt='%H:%M:%S')
         else:
-            logging.basicConfig(format='%(asctime)s: MSG.\t==> %(message)s',
+            logging.basicConfig(format='%(asctime)s: MSG. ==> %(message)s',
                                 level=logging.INFO,
                                 datefmt='%H:%M:%S')
         get_client_data_from_file(file_path)
@@ -545,8 +603,7 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         try:
             logging.info('Finalització per ^C')
-            udp_sock.close()
-            tcp_sock.close()
+            close_all_active_sockets()
             sys.exit(1)
         except NameError:
             sys.exit(1)
